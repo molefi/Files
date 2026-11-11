@@ -1,10 +1,199 @@
-Get-ChildItem .\input\metadata\*.csv |
-    Select-Object Name, Length
+#!/usr/bin/env python3
+"""Offline, metadata-only BigQuery provisioning planner for VitAI Non-Prod.
+
+Reads an approved manifest and local BigQuery INFORMATION_SCHEMA.TABLES CSV exports.
+Writes REVIEW-ONLY SQL; does not connect to GCP or execute SQL.
+"""
+import argparse
+import csv
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+DESTINATION_PROJECT = 'tps-prv1-cmlkr-np-w8k'
+SOURCE_PROJECTS = {'d-vzaeng-prd-sqr2', 'd-vzasci-prd-lghi'}
+CREATE_RE = re.compile(
+    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+)?'
+    r'(?:TABLE|VIEW|MATERIALIZED\s+VIEW|SNAPSHOT\s+TABLE)\s+'
+    r'(?:IF\s+NOT\s+EXISTS\s+)?'
+    r'(?P<identifier>`[^`]+`|[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*){0,2})',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
-py -3 -c "import csv,pathlib; files=pathlib.Path('input/metadata').glob('*.csv'); [(print(p.name, list(next(csv.DictReader(open(p,encoding='utf-8-sig',newline=''))).keys()))) for p in files]"
+def read_csv(path):
+    with path.open('r', encoding='utf-8-sig', newline='') as handle:
+        return list(csv.DictReader(handle))
 
 
-Select-String -Path .\prepare_nonprod.py `
-  -Pattern "ddl","metadata","DictReader" `
-  -Context 2,2
+def value(row, *names):
+    for name in names:
+        if row.get(name) is not None:
+            return str(row[name]).strip()
+    return ''
+
+
+def load_catalog(directory):
+    catalog = defaultdict(list)
+    files = sorted(directory.glob('*.csv'))
+    if not files:
+        raise ValueError(f'No CSV files found in {directory}')
+    stats = Counter()
+    for path in files:
+        rows = read_csv(path)
+        if not rows:
+            print(f'WARNING: empty CSV: {path.name}')
+            continue
+        cols = set(rows[0])
+        bq_cols = {'table_catalog', 'table_schema', 'table_name', 'ddl'}
+        old_cols = {'source_project', 'source_dataset', 'source_object', 'create_statement'}
+        if bq_cols.issubset(cols):
+            fmt = 'bigquery'
+        elif old_cols.issubset(cols):
+            fmt = 'legacy'
+        else:
+            print(f'WARNING: unsupported CSV headers in {path.name}: {sorted(cols)}')
+            stats['unsupported_files'] += 1
+            continue
+        for row in rows:
+            if fmt == 'bigquery':
+                key = (value(row, 'table_catalog'), value(row, 'table_schema'), value(row, 'table_name'))
+                ddl = value(row, 'ddl')
+                typ = value(row, 'table_type')
+            else:
+                key = (value(row, 'source_project'), value(row, 'source_dataset'), value(row, 'source_object'))
+                ddl = value(row, 'create_statement')
+                typ = value(row, 'object_type')
+            if not all(key):
+                stats['incomplete_rows'] += 1
+                continue
+            catalog[key].append({'ddl': ddl, 'type': typ.upper(), 'file': path.name})
+            stats['loaded_rows'] += 1
+        print(f'Read {len(rows)} rows from {path.name} ({fmt})')
+    if not catalog:
+        raise ValueError('No usable metadata loaded. Check CSV headers and file contents.')
+    return catalog, stats
+
+
+def load_manifest(path):
+    rows = read_csv(path)
+    if not rows:
+        raise ValueError('Manifest is empty')
+    needed = {'source_project', 'source_dataset', 'source_object'}
+    if not needed.issubset(rows[0]):
+        raise ValueError(f'Manifest needs columns: {sorted(needed)}. Found: {list(rows[0])}')
+    # Respect a pre-filtered approved manifest; do not infer approvals from unrelated catalog objects.
+    selected = {}
+    for row in rows:
+        key = tuple(value(row, c) for c in ('source_project', 'source_dataset', 'source_object'))
+        if all(key):
+            selected.setdefault(key, row)
+    return rows, selected
+
+
+def normalize_ddl(ddl, key, kind):
+    """Rewrite only the DDL target; leave references in the body untouched for review."""
+    match = CREATE_RE.match(ddl)
+    if not match:
+        return None, 'UNSUPPORTED_CREATE_SYNTAX'
+    original_target = match.group('identifier').strip('`')
+    if original_target.lower() != '.'.join(key).lower():
+        return None, 'DDL_TARGET_MISMATCH'
+    if kind not in ('BASE TABLE', 'VIEW'):
+        return None, 'UNSUPPORTED_OBJECT_TYPE'
+    # Only replace the target identifier, not arbitrary references inside view SQL.
+    target = f'`{DESTINATION_PROJECT}.{key[1]}.{key[2]}`'
+    rewritten = ddl[:match.start('identifier')] + target + ddl[match.end('identifier'):]
+    # Prevent unintended production dependencies, including quoted or embedded identifiers.
+    if any(source.lower() in rewritten.lower() for source in SOURCE_PROJECTS):
+        return None, 'SOURCE_PROJECT_REFERENCE_IN_DDL'
+    # Avoid data population and destructive statements. The generated file remains REVIEW-ONLY.
+    if re.search(r'\bAS\s+SELECT\b', rewritten, re.IGNORECASE) and kind == 'BASE TABLE':
+        return None, 'TABLE_CTAS_REQUIRES_REVIEW'
+    if kind == 'BASE TABLE':
+        # Explicitly exclude unsupported external/snapshot table DDL.
+        if re.match(r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+TABLE|SNAPSHOT\s+TABLE)', rewritten, re.I):
+            return None, 'UNSUPPORTED_OBJECT_TYPE'
+    return rewritten.rstrip().rstrip(';') + ';', None
+
+
+def write_sql(path, title, statements):
+    header = (f'-- {title}\n-- Destination: {DESTINATION_PROJECT}\n'
+              '-- REVIEW ONLY: inspect dependencies, access controls, locations, and costs before running.\n'
+              '-- No source data is copied by this planning script.\n\n')
+    path.write_text(header + '\n\n'.join(statements) + ('\n' if statements else ''), encoding='utf-8')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--manifest', type=Path, required=True)
+    parser.add_argument('--metadata', type=Path, required=True)
+    parser.add_argument('--out', type=Path, default=Path('generated'))
+    parser.add_argument('--region', default='europe-west2')
+    args = parser.parse_args()
+    if not args.manifest.is_file():
+        parser.error(f'Manifest not found: {args.manifest}')
+    if not args.metadata.is_dir():
+        parser.error(f'Metadata directory not found: {args.metadata}')
+    args.out.mkdir(parents=True, exist_ok=True)
+    rows, selected = load_manifest(args.manifest)
+    catalog, stats = load_catalog(args.metadata)
+    holds = []
+    tables, views = [], []
+    datasets = sorted({key[1] for key in selected})
+    for key in sorted(selected):
+        if key[0] not in SOURCE_PROJECTS:
+            holds.append((*key, 'UNEXPECTED_SOURCE_PROJECT'))
+            continue
+        matches = catalog.get(key, [])
+        if not matches:
+            holds.append((*key, 'DDL_NOT_IN_LOCAL_EXPORTS'))
+            continue
+        candidates = {(m['ddl'], m['type']) for m in matches if m['ddl']}
+        if not candidates:
+            holds.append((*key, 'MISSING_DDL'))
+            continue
+        if len(candidates) != 1:
+            holds.append((*key, 'CONFLICTING_DDL_OR_OBJECT_TYPES'))
+            continue
+        ddl, kind = next(iter(candidates))
+        rewritten, reason = normalize_ddl(ddl, key, kind)
+        if reason:
+            holds.append((*key, reason))
+            continue
+        if kind == 'BASE TABLE':
+            tables.append(rewritten)
+        elif kind == 'VIEW':
+            views.append(rewritten)
+        else:
+            holds.append((*key, 'UNSUPPORTED_OBJECT_TYPE'))
+
+    datasets_sql = [f'CREATE SCHEMA IF NOT EXISTS `{DESTINATION_PROJECT}.{ds}` OPTIONS(location="{args.region}");' for ds in datasets]
+    write_sql(args.out / '01_create_datasets.sql', 'Dataset creation statements', datasets_sql)
+    write_sql(args.out / '02_create_tables_REVIEW.sql', 'Physical table definitions', tables)
+    write_sql(args.out / '03_create_views_REVIEW.sql', 'View definitions (dependencies need review)', views)
+    with (args.out / 'holds.csv').open('w', encoding='utf-8', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['source_project', 'source_dataset', 'source_object', 'reason'])
+        writer.writerows(holds)
+    counts = Counter(item[3] for item in holds)
+    summary = [
+        f'Non-Prod destination: {DESTINATION_PROJECT}',
+        f'Source rows: {len(rows)}',
+        f'Unique manifest objects: {len(selected)}',
+        f'Datasets: {len(datasets)}',
+        f'Metadata rows loaded: {stats["loaded_rows"]}',
+        f'Table DDL prepared: {len(tables)}',
+        f'View DDL prepared: {len(views)}',
+        f'Held entries: {len(holds)}',
+        'Hold reasons:',
+        *[f'  {name}: {count}' for name, count in sorted(counts.items())],
+        'NO CLOUD ACTIONS PERFORMED',
+    ]
+    (args.out / 'summary.txt').write_text('\n'.join(summary) + '\n', encoding='utf-8')
+    print('\n'.join(summary))
+    print(f'\nReview outputs in: {args.out.resolve()}')
+
+
+if __name__ == '__main__':
+    main()
