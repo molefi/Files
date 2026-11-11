@@ -1,0 +1,10 @@
+Get-ChildItem .\input\metadata\*.csv |
+    Select-Object Name, Length
+
+
+py -3 -c "import csv,pathlib; files=pathlib.Path('input/metadata').glob('*.csv'); [(print(p.name, list(next(csv.DictReader(open(p,encoding='utf-8-sig',newline=''))).keys()))) for p in files]"
+
+
+Select-String -Path .\prepare_nonprod.py `
+  -Pattern "ddl","metadata","DictReader" `
+  -Context 2,2
