@@ -28,7 +28,6 @@ permissions:
   contents: read
 
 jobs:
-
   manifest:
     name: Validate Dashboard Manifest
     runs-on: ubuntu-latest
@@ -63,10 +62,13 @@ jobs:
     name: Validate BigQuery Connections
     needs: manifest
 
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_bigquery == true }}
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' &&
+        inputs.check_bigquery == true
+      }}
 
     runs-on: ubuntu-latest
-
     environment: nonprod
 
     permissions:
@@ -92,29 +94,31 @@ jobs:
 
       - name: Verify GCP configuration
         env:
-          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
-          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+          WIF_SERVICE_ACCOUNT: ${{ vars.WIF_SERVICE_ACCOUNT }}
         run: |
           test -n "$BQ_BILLING_PROJECT" || {
             echo "::error::GCP_PROJECT_ID is missing"
             exit 1
           }
 
-          test -n "$GCP_WIF_PROVIDER" || {
-            echo "::error::GCP_WIF_PROVIDER is missing"
+          test -n "$WIF_PROVIDER" || {
+            echo "::error::WIF_PROVIDER is missing"
             exit 1
           }
 
-          test -n "$GCP_SERVICE_ACCOUNT" || {
-            echo "::error::GCP_SERVICE_ACCOUNT is missing"
+          test -n "$WIF_SERVICE_ACCOUNT" || {
+            echo "::error::WIF_SERVICE_ACCOUNT is missing"
             exit 1
           }
+
+          echo "Required GCP configuration is present."
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Validate BigQuery connections
