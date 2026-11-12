@@ -1,38 +1,130 @@
-Select-String -Path .\generated\02_create_tables_REVIEW.sql `
-  -Pattern 'CREATE TABLE' |
-  ForEach-Object {
-    if ($_.Line -match 'tps-prv1-cmlkr-np-w8k\.([^.]+)\.') {
-      $Matches[1]
-    }
-  } | Sort-Object -Unique
 
+name: Validate Dashboard Connections (Read Only)
 
-Import-Csv .\generated\holds.csv |
-  Format-Table -AutoSize
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "config/**"
+      - "scripts/**"
+      - ".github/workflows/validate-dashboard-connections.yml"
 
+  pull_request:
+    paths:
+      - "config/**"
+      - "scripts/**"
+      - ".github/workflows/validate-dashboard-connections.yml"
 
-Select-String `
-  -Path .\generated\02_create_tables_REVIEW.sql `
-  -Pattern 'd-vzaeng-prd-sqr2','d-vzasci-prd-lghi'
+  workflow_dispatch:
+    inputs:
+      check_bigquery:
+        description: "Run live BigQuery connectivity validation"
+        required: true
+        type: boolean
+        default: false
 
+permissions:
+  contents: read
 
-CREATE TABLE IF NOT EXISTS
-  `tps-prv1-cmlkr-np-w8k.nba_prod_v2.CHECK_LOGS`
-(
-  check_name STRING,
-  status STRING,
-  message STRING,
-  run_date DATE,
-  executed_time TIMESTAMP
-);
+jobs:
 
+  manifest:
+    name: Validate Dashboard Manifest
+    runs-on: ubuntu-latest
 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-SELECT
-  column_name,
-  data_type,
-  is_nullable
-FROM
-  `tps-prv1-cmlkr-np-w8k.nba_prod_v2.INFORMATION_SCHEMA.COLUMNS`
-WHERE table_name = 'CHECK_LOGS'
-ORDER BY ordinal_position;
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-cloud-bigquery
+
+      - name: Validate dashboard manifest
+        run: |
+          python scripts/validate.py
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-manifest-validation
+          path: reports/
+          if-no-files-found: warn
+
+  bigquery:
+    name: Validate BigQuery Connections
+    needs: manifest
+
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_bigquery == true }}
+
+    runs-on: ubuntu-latest
+
+    environment: nonprod
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      BQ_BILLING_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-cloud-bigquery
+
+      - name: Verify GCP configuration
+        env:
+          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          test -n "$BQ_BILLING_PROJECT" || {
+            echo "::error::GCP_PROJECT_ID is missing"
+            exit 1
+          }
+
+          test -n "$GCP_WIF_PROVIDER" || {
+            echo "::error::GCP_WIF_PROVIDER is missing"
+            exit 1
+          }
+
+          test -n "$GCP_SERVICE_ACCOUNT" || {
+            echo "::error::GCP_SERVICE_ACCOUNT is missing"
+            exit 1
+          }
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Validate BigQuery connections
+        run: |
+          python scripts/validate.py --check-bigquery
+
+      - name: Upload BigQuery validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-bigquery-validation
+          path: reports/
+          if-no-files-found: warn
